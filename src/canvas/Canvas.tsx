@@ -1,14 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
 import type { PointerEvent as ReactPointerEvent } from 'react';
 import { BASE_SCALE, screenToWorld, worldToScreen, zoomAt } from '../core/coordinates';
-import { boundsOf, moveHandle, objectAnchors, resolveAnchor, splitCircle, translateObjects } from '../core/geometry';
+import { boundsOf, cutShape, moveHandle, objectAnchors, projectToPath, resolveAnchor, translateObjects } from '../core/geometry';
 import { isObjectDefined } from '../core/defined';
 import { snapPoint } from '../core/snapping';
 import type { Anchor, ObjectType, PathBinding, Scene, SceneObject, ToolId, Vec, Viewport } from '../core/types';
+import { findPlanarFaceAtPoint, pointInPolygon, shapeBoundary } from '../core/planar';
 import { makeObject } from '../tools/registry';
 import type { DrawingObject, DrawingObjectType } from '../tools/registry';
 import { SceneShape } from './SceneShape';
-import { arcSvgPath, circleCutAngle, distinctCircleCuts, drawingHasExtent, polygonHasValidReferences } from './construction';
+import { drawingHasExtent, polygonHasValidReferences } from './construction';
 
 export interface CanvasProps {
   scene: Scene; selection: string[]; tool: ToolId; viewport: Viewport;
@@ -25,11 +26,19 @@ type Gesture =
   | { kind: 'handle'; base: Scene; id: string; index: number; moved: boolean }
   | { kind: 'draw'; base: Scene; first: Anchor; object: DrawingObject; startScreen: Vec; moved: boolean };
 type SnapGuide = { point: Anchor; kind: string };
-type CircleObject = Extract<SceneObject, { type: 'circle' }>;
-type SplitStage = { circleId: string; scene: Scene; firstAngle: number | null; hoverAngle: number | null; duplicate: boolean };
+type CutStage = { objectId: string; scene: Scene; first: Vec | null; hover: Vec | null; error?: string };
+type PerpendicularStage = { scene: Scene; origin: Anchor; error?: string };
+type PerpendicularTarget = { object: SceneObject; point: Vec; binding: PathBinding; distance: number };
 
 function inInput(target: EventTarget | null) {
   return target instanceof HTMLElement && Boolean(target.closest('input, textarea, select, [contenteditable="true"], .monaco-editor'));
+}
+
+function polygonArea(points: Vec[]) {
+  return Math.abs(points.reduce((sum, point, index) => {
+    const next = points[(index + 1) % points.length];
+    return sum + point.x * next.y - next.x * point.y;
+  }, 0) / 2);
 }
 
 function namedObject(type: DrawingObjectType, anchors: Anchor[], scene: Scene, binding?: PathBinding): DrawingObject {
@@ -64,7 +73,8 @@ export function Canvas(props: CanvasProps) {
   const svgRef = useRef<SVGSVGElement>(null);
   const gestureRef = useRef<Gesture | null>(null);
   const polygonRef = useRef<Anchor[]>([]);
-  const splitRef = useRef<SplitStage | null>(null);
+  const cutRef = useRef<CutStage | null>(null);
+  const perpendicularRef = useRef<PerpendicularStage | null>(null);
   const lastSnapRef = useRef<ReturnType<typeof snapPoint> | null>(null);
   const spaceRef = useRef(false);
   const [space, setSpace] = useState(false);
@@ -73,7 +83,9 @@ export function Canvas(props: CanvasProps) {
   const [polygon, setPolygon] = useState<Anchor[]>([]);
   const [hover, setHover] = useState<Anchor | null>(null);
   const [guide, setGuide] = useState<SnapGuide | null>(null);
-  const [split, setSplit] = useState<SplitStage | null>(null);
+  const [cut, setCut] = useState<CutStage | null>(null);
+  const [perpendicular, setPerpendicular] = useState<PerpendicularStage | null>(null);
+  const [perpendicularPreview, setPerpendicularPreview] = useState<PerpendicularTarget | null>(null);
   const { scene, selection, tool, viewport } = props;
 
   const screenPoint = (event: { clientX: number; clientY: number }): Vec => {
@@ -92,33 +104,85 @@ export function Canvas(props: CanvasProps) {
     return result.point;
   };
   const clearPolygon = () => { polygonRef.current = []; setPolygon([]); setHover(null); };
-  const updateSplit = (stage: SplitStage | null) => { splitRef.current = stage; setSplit(stage); };
-  const beginSplit = (circle: CircleObject) => {
+  const updateCut = (stage: CutStage | null) => { cutRef.current = stage; setCut(stage); };
+  const beginCut = (object: SceneObject) => {
     const state = propsRef.current;
-    if (circle.locked || !circle.visible || circle.radius <= 0 || !isObjectDefined(circle, state.scene.objects)) return;
-    updateSplit({ circleId: circle.id, scene: state.scene, firstAngle: null, hoverAngle: null, duplicate: false });
-    state.onSelect([circle.id]);
+    if (object.locked || !object.visible || !isObjectDefined(object, state.scene.objects) || !['line', 'arrow', 'rectangle', 'polygon', 'circle', 'arc', 'sector', 'plot'].includes(object.type)) return;
+    updateCut({ objectId: object.id, scene: state.scene, first: null, hover: null });
+    state.onSelect([object.id]);
     setGuide(null);
   };
-  const splitClick = (world: Vec) => {
+  const finishCut = (world: Vec) => {
     const state = propsRef.current;
-    const stage = splitRef.current;
+    const stage = cutRef.current;
     if (!stage) return;
-    const circle = state.scene.objects.find(object => object.id === stage.circleId);
-    if (stage.scene !== state.scene || circle?.type !== 'circle' || circle.locked || !circle.visible) { updateSplit(null); return; }
-    const angle = circleCutAngle(resolveAnchor(circle.center, state.scene.objects), world);
-    if (angle === null) return;
-    if (stage.firstAngle === null) { updateSplit({ ...stage, firstAngle: angle, hoverAngle: angle, duplicate: false }); return; }
-    if (!distinctCircleCuts(circle.radius, stage.firstAngle, angle, state.viewport.zoom)) {
-      updateSplit({ ...stage, hoverAngle: angle, duplicate: true });
+    if (stage.scene !== state.scene || !state.scene.objects.some(object => object.id === stage.objectId)) { updateCut(null); return; }
+    const point = snapPoint(world, state.scene.objects, state.viewport, state.scene.settings, [stage.objectId]).point;
+    if (!stage.first) { updateCut({ ...stage, first: { x: point.x, y: point.y }, hover: { x: point.x, y: point.y }, error: undefined }); return; }
+    const result = cutShape(state.scene.objects, stage.objectId, stage.first, point);
+    if (!result) {
+      updateCut({ ...stage, hover: { x: point.x, y: point.y }, error: '절단선이 도형을 가로지르도록 두 점을 찍으세요.' });
       return;
     }
-    const objects = splitCircle(state.scene.objects, circle.id, stage.firstAngle, angle);
-    updateSplit(null);
+    updateCut(null);
     setGuide(null);
-    state.onChange({ ...state.scene, objects }, '원을 두 호로 나누기');
-    state.onSelect([circle.id]);
+    state.onChange({ ...state.scene, objects: result.objects }, '도형 자르기');
+    state.onSelect(result.pieceIds);
     state.onTool('select');
+  };
+  const updatePerpendicular = (stage: PerpendicularStage | null) => { perpendicularRef.current = stage; setPerpendicular(stage); };
+  const nearestSupport = (world: Vec): PerpendicularTarget | null => {
+    const state = propsRef.current;
+    const tolerance = 16 / (BASE_SCALE * state.viewport.zoom);
+    let best: PerpendicularTarget | null = null;
+    for (const object of state.scene.objects) {
+      if ((object.type !== 'line' && object.type !== 'arrow') || !object.visible || !isObjectDefined(object, state.scene.objects)) continue;
+      const projection = projectToPath(world, object, state.scene.objects);
+      if (!projection) continue;
+      const distance = Math.hypot(projection.point.x - world.x, projection.point.y - world.y);
+      if (distance <= tolerance && (!best || distance < best.distance)) best = { object, point: projection.point, binding: projection.binding, distance };
+    }
+    return best;
+  };
+  const addPerpendicular = (world: Vec) => {
+    const state = propsRef.current, stage = perpendicularRef.current;
+    if (!stage) { updatePerpendicular({ scene: state.scene, origin: snap(world) }); setPerpendicularPreview(null); return; }
+    if (stage.scene !== state.scene) { updatePerpendicular(null); return; }
+    const target = nearestSupport(world);
+    if (!target) { updatePerpendicular({ ...stage, error: '기준 선분 가까이를 클릭하세요.' }); setPerpendicularPreview(null); return; }
+    const origin = resolveAnchor(stage.origin, state.scene.objects);
+    if (Math.hypot(target.point.x - origin.x, target.point.y - origin.y) < 1e-7) {
+      updatePerpendicular({ ...stage, error: '점과 수선의 발이 겹칩니다. 다른 점이나 선분을 선택하세요.' }); setPerpendicularPreview(null); return;
+    }
+    const foot = namedObject('point', [target.point], state.scene, target.binding);
+    const line = namedObject('line', [stage.origin, { ...target.point, pointId: foot.id }], state.scene);
+    foot.name = '수선의 발';
+    state.onChange({ ...state.scene, objects: [...state.scene.objects, foot, line] }, '수선 내리기');
+    state.onSelect([line.id, foot.id]);
+    setGuide(null);
+    updatePerpendicular(null);
+    setPerpendicularPreview(null);
+    state.onTool('select');
+  };
+  const fillArea = (world: Vec) => {
+    const state = propsRef.current;
+    const boundary = findPlanarFaceAtPoint(state.scene.objects, world);
+    const topmost = [...state.scene.objects].reverse().find(object => {
+      if (object.locked || !object.visible || !isObjectDefined(object, state.scene.objects)) return false;
+      const shape = shapeBoundary(object, state.scene.objects);
+      return !!shape && pointInPolygon(world, shape) && (!boundary || polygonArea(boundary) >= polygonArea(shape) - 1e-6);
+    });
+    if (topmost) {
+      state.onChange({ ...state.scene, objects: state.scene.objects.map(object => object.id === topmost.id ? { ...object, style: { ...object.style, fill: '#f3d486' } } : object) }, '영역 색칠');
+      state.onSelect([topmost.id]);
+      return;
+    }
+    if (!boundary) return;
+    const count = state.scene.objects.filter(object => object.type === 'polygon' && object.name.startsWith('영역')).length + 1;
+    const base = namedObject('polygon', boundary, state.scene);
+    const region: SceneObject = { ...base, name: `영역 ${count}`, style: { ...base.style, stroke: 'none', fill: '#f3d486', opacity: 0.56 } };
+    state.onChange({ ...state.scene, objects: [...state.scene.objects, region] }, '영역 색칠');
+    state.onSelect([region.id]);
   };
   const cancel = () => {
     const active = gestureRef.current;
@@ -126,7 +190,9 @@ export function Canvas(props: CanvasProps) {
     gestureRef.current = null;
     setGestureUI(null);
     clearPolygon();
-    updateSplit(null);
+    updateCut(null);
+    updatePerpendicular(null);
+    setPerpendicularPreview(null);
     setGuide(null);
   };
   const finishPolygon = () => {
@@ -180,7 +246,7 @@ export function Canvas(props: CanvasProps) {
       if (svgRef.current?.closest('[inert]')) return;
       if (inInput(event.target)) return;
       if ((event.ctrlKey || event.metaKey) && ['z', 'y'].includes(event.key.toLowerCase())) {
-        if (splitRef.current || polygonRef.current.length) { cancel(); propsRef.current.onTool('select'); }
+        if (cutRef.current || perpendicularRef.current || polygonRef.current.length) { cancel(); propsRef.current.onTool('select'); }
         return;
       }
       if (event.code === 'Space') { event.preventDefault(); spaceRef.current = true; setSpace(true); }
@@ -197,15 +263,21 @@ export function Canvas(props: CanvasProps) {
 
   useEffect(() => {
     cancel();
-    if (tool === 'split') {
+    if (tool === 'cut') {
       const state = propsRef.current;
-      const selectedCircle = state.scene.objects.find(object => state.selection.includes(object.id) && object.type === 'circle');
-      if (selectedCircle?.type === 'circle') beginSplit(selectedCircle);
+      const selectedObject = state.scene.objects.find(object => state.selection.includes(object.id) && ['line', 'arrow', 'rectangle', 'polygon', 'circle', 'arc', 'sector', 'plot'].includes(object.type));
+      if (selectedObject) beginCut(selectedObject);
     }
   }, [tool]);
   useEffect(() => {
-    if (splitRef.current && splitRef.current.scene !== scene) {
-      updateSplit(null);
+    if (cutRef.current && cutRef.current.scene !== scene) {
+      updateCut(null);
+      setGuide(null);
+      propsRef.current.onTool('select');
+    }
+    if (perpendicularRef.current && perpendicularRef.current.scene !== scene) {
+      updatePerpendicular(null);
+      setPerpendicularPreview(null);
       setGuide(null);
       propsRef.current.onTool('select');
     }
@@ -213,11 +285,16 @@ export function Canvas(props: CanvasProps) {
 
   function startShape(event: ReactPointerEvent<SVGGElement>, object: SceneObject) {
     const state = propsRef.current;
-    if (state.tool === 'split' && !spaceRef.current && event.button === 0) {
+    if (state.tool === 'cut' && !spaceRef.current && event.button === 0) {
       event.stopPropagation();
       capture(event);
-      if (splitRef.current) splitClick(screenToWorld(screenPoint(event), state.viewport));
-      else if (object.type === 'circle') beginSplit(object);
+      if (cutRef.current) finishCut(screenToWorld(screenPoint(event), state.viewport));
+      else beginCut(object);
+      return;
+    }
+    if (state.tool === 'fill' && !spaceRef.current && event.button === 0) {
+      event.stopPropagation();
+      fillArea(screenToWorld(screenPoint(event), state.viewport));
       return;
     }
     if (state.tool !== 'select' || spaceRef.current || event.button !== 0) return;
@@ -267,18 +344,16 @@ export function Canvas(props: CanvasProps) {
       setGestureUI(gestureRef.current);
       return;
     }
-    if (state.tool === 'split') {
-      if (splitRef.current) splitClick(world);
+    if (state.tool === 'cut') {
+      if (cutRef.current) finishCut(world);
       else {
-        const circles = state.scene.objects.filter((object): object is CircleObject => object.type === 'circle' && object.visible && !object.locked && isObjectDefined(object, state.scene.objects));
-        const nearby = circles.reverse().find(circle => {
-          const center = resolveAnchor(circle.center, state.scene.objects);
-          return Math.abs(Math.hypot(world.x - center.x, world.y - center.y) - circle.radius) * BASE_SCALE * state.viewport.zoom <= 16;
-        });
-        if (nearby) beginSplit(nearby);
+        const selectedObject = state.scene.objects.find(object => state.selection.includes(object.id));
+        if (selectedObject) beginCut(selectedObject);
       }
       return;
     }
+    if (state.tool === 'fill') { fillArea(world); return; }
+    if (state.tool === 'perpendicular') { addPerpendicular(world); return; }
     const point = snap(world);
     if (state.tool === 'polygon') {
       const points = polygonRef.current;
@@ -321,15 +396,18 @@ export function Canvas(props: CanvasProps) {
     state.onCursor?.(world);
     const active = gestureRef.current;
     if (!active) {
-      if (state.tool === 'split') {
-        const stage = splitRef.current;
-        const circle = stage && state.scene.objects.find(object => object.id === stage.circleId);
-        if (stage && circle?.type === 'circle') {
-          const center = resolveAnchor(circle.center, state.scene.objects);
-          const angle = circleCutAngle(center, world);
-          updateSplit({ ...stage, hoverAngle: angle, duplicate: false });
-          setGuide(angle === null ? null : { point: { x: center.x + circle.radius * Math.cos(angle * Math.PI / 180), y: center.y + circle.radius * Math.sin(angle * Math.PI / 180) }, kind: 'path' });
-        } else setGuide(null);
+      if (state.tool === 'cut') {
+        if (cutRef.current) updateCut({ ...cutRef.current, hover: world });
+        else setGuide(null);
+        return;
+      }
+      if (state.tool === 'perpendicular') {
+        if (perpendicularRef.current) {
+          const target = nearestSupport(world);
+          setGuide(target ? { point: target.point, kind: 'path' } : null);
+          setPerpendicularPreview(target);
+          setPerpendicular({ ...perpendicularRef.current, error: target ? undefined : '기준 선분 가까이를 클릭하세요.' });
+        } else { setPerpendicularPreview(null); snap(world); }
         return;
       }
       if (state.tool !== 'select' && state.tool !== 'hand') setHover(snap(world));
@@ -418,10 +496,12 @@ export function Canvas(props: CanvasProps) {
   const visibleMin = screenToWorld({ x: 0, y: size.height }, viewport);
   const visibleMax = screenToWorld({ x: size.width, y: 0 }, viewport);
   const axisTicks = (min: number, max: number) => Array.from({ length: Math.min(200, Math.max(0, Math.floor(max / tickStep) - Math.ceil(min / tickStep) + 1)) }, (_, index) => Number(((Math.ceil(min / tickStep) + index) * tickStep).toPrecision(10))).filter(value => value !== 0);
-  const splitCircleObject = split ? scene.objects.find(object => object.id === split.circleId && object.type === 'circle') : undefined;
-  const splitCenter = splitCircleObject?.type === 'circle' ? resolveAnchor(splitCircleObject.center, scene.objects) : null;
-  const splitFirst = split && splitCenter && splitCircleObject?.type === 'circle' && split.firstAngle !== null ? worldToScreen({ x: splitCenter.x + splitCircleObject.radius * Math.cos(split.firstAngle * Math.PI / 180), y: splitCenter.y + splitCircleObject.radius * Math.sin(split.firstAngle * Math.PI / 180) }, viewport) : null;
-  const splitHint = !split ? '나눌 원을 클릭하세요' : split.duplicate ? '첫 점과 떨어진 곳을 선택하세요' : split.firstAngle === null ? '원 둘레에서 첫 번째 점을 클릭하세요' : '둘레에서 두 번째 점을 클릭하세요';
+  const cutFirst = cut?.first ? worldToScreen(cut.first, viewport) : null;
+  const cutHover = cut?.hover ? worldToScreen(cut.hover, viewport) : null;
+  const cutHint = !cut ? '자를 도형을 클릭하세요' : cut.error ?? (cut.first ? '자를 선을 가로지르도록 두 번째 점을 클릭하세요' : '자를 도형 위에서 첫 번째 점을 클릭하세요');
+  const perpendicularOrigin = perpendicular ? worldToScreen(resolveAnchor(perpendicular.origin, scene.objects), viewport) : null;
+  const perpendicularFoot = perpendicularPreview ? worldToScreen(perpendicularPreview.point, viewport) : null;
+  const perpendicularHint = perpendicular?.error ?? (perpendicular ? '기준 선분 위에서 수선의 발을 지정하세요' : '점을 클릭한 뒤 기준 선분을 클릭하세요');
 
   return <svg ref={svgRef} className="drawing-canvas" data-testid="canvas" role="application" aria-label="도형 편집 작업지" tabIndex={0} width="100%" height="100%" style={{ display: 'block', touchAction: 'none', outline: 'none', cursor, userSelect: 'none' }} onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={cancel} onDoubleClick={() => { if (tool === 'polygon') finishPolygon(); }} onContextMenu={event => event.preventDefault()}>
     <defs><pattern id="canvas-grid" width={gridSpacing} height={gridSpacing} patternUnits="userSpaceOnUse" x={viewport.x % gridSpacing} y={viewport.y % gridSpacing}><path d={`M ${gridSpacing} 0 L 0 0 0 ${gridSpacing}`} fill="none" stroke="#e7edf1" strokeWidth="0.8" /></pattern></defs>
@@ -444,12 +524,16 @@ export function Canvas(props: CanvasProps) {
       const p = worldToScreen(point, viewport);
       return <circle key={index} data-testid={`handle-${selected.id}-${index}`} aria-label={selected.type === 'circle' ? index === 0 ? '중심 이동' : '반지름 조절' : selected.type === 'arc' || selected.type === 'sector' ? ['중심 이동', '시작점과 반지름 조절', '끝점과 각도 조절'][index] : `꼭짓점 ${index + 1}`} cx={p.x} cy={p.y} r={5} fill="white" stroke="#079d91" strokeWidth={2} style={{ cursor: 'crosshair' }} onPointerDown={event => startHandle(event, selected.id, index)} />;
     })}
-    {tool === 'split' && <g pointerEvents="none" data-testid="split-preview">
-      {splitCenter && splitCircleObject?.type === 'circle' && <circle cx={worldToScreen(splitCenter, viewport).x} cy={worldToScreen(splitCenter, viewport).y} r={splitCircleObject.radius * BASE_SCALE * viewport.zoom} fill="none" stroke="#0a9f92" strokeWidth="4" opacity="0.25" />}
-      {split && splitCenter && splitCircleObject?.type === 'circle' && split.firstAngle !== null && split.hoverAngle !== null && <path d={arcSvgPath(splitCenter, splitCircleObject.radius, split.firstAngle, (split.hoverAngle - split.firstAngle + 360) % 360, viewport)} fill="none" stroke="#0a9f92" strokeWidth="3" strokeDasharray="6 3" />}
-      {splitFirst && <><circle cx={splitFirst.x} cy={splitFirst.y} r="6" fill="#0a9f92" stroke="white" strokeWidth="2" /><text x={splitFirst.x + 10} y={splitFirst.y - 10} fontSize="11" fill="#078476">첫 점</text></>}
-      <rect x="12" y={size.height - 73} width={Math.min(284, size.width - 24)} height="30" rx="6" fill="#effaf7" stroke="#b8e0d7" />
-      <text data-testid="split-hint" x="23" y={size.height - 54} fontSize="11" fill="#147d70">{splitHint}</text>
+    {tool === 'cut' && <g pointerEvents="none" data-testid="cut-preview">
+      {cutFirst && cutHover && <line x1={cutFirst.x} y1={cutFirst.y} x2={cutHover.x} y2={cutHover.y} stroke="#0a9f92" strokeWidth="2" strokeDasharray="7 4" />}
+      {cutFirst && <circle cx={cutFirst.x} cy={cutFirst.y} r="5" fill="#0a9f92" stroke="white" strokeWidth="2" />}
+      <rect x="12" y={size.height - 73} width={Math.min(360, size.width - 24)} height="30" rx="6" fill="#effaf7" stroke="#b8e0d7" />
+      <text data-testid="cut-hint" x="23" y={size.height - 54} fontSize="11" fill="#147d70">{cutHint}</text>
+    </g>}
+    {tool === 'perpendicular' && perpendicularOrigin && <g pointerEvents="none" data-testid="perpendicular-preview">
+      {perpendicularFoot && <><line x1={perpendicularOrigin.x} y1={perpendicularOrigin.y} x2={perpendicularFoot.x} y2={perpendicularFoot.y} stroke="#0a9f92" strokeWidth="1.7" strokeDasharray="6 3" /><circle cx={perpendicularFoot.x} cy={perpendicularFoot.y} r="4" fill="#0a9f92" stroke="white" strokeWidth="1.5" /></>}
+      <rect x="12" y={size.height - 73} width={Math.min(360, size.width - 24)} height="30" rx="6" fill="#effaf7" stroke="#b8e0d7" />
+      <text data-testid="perpendicular-hint" x="23" y={size.height - 54} fontSize="11" fill="#147d70">{perpendicularHint}</text>
     </g>}
     {marqueeStart && marqueeEnd && <rect x={Math.min(marqueeStart.x, marqueeEnd.x)} y={Math.min(marqueeStart.y, marqueeEnd.y)} width={Math.abs(marqueeEnd.x - marqueeStart.x)} height={Math.abs(marqueeEnd.y - marqueeStart.y)} fill="rgba(9, 161, 147, 0.07)" stroke="#0aa395" strokeDasharray="4 3" pointerEvents="none" />}
     {polygon.length > 0 && <g pointerEvents="none"><polyline points={polygonPoints.map(point => `${point.x},${point.y}`).join(' ')} stroke="#0a9f92" strokeWidth={1.6} fill="rgba(10,159,146,0.06)" strokeDasharray="5 3" />{polygonPoints.slice(0, polygon.length).map((point, index) => <circle key={index} cx={point.x} cy={point.y} r={index === 0 ? 6 : 4} fill="white" stroke="#0a9f92" strokeWidth={2} />)}</g>}

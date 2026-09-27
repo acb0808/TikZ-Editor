@@ -60,7 +60,7 @@ test('formula graph, coefficient and a bound point survive save and reload', asy
   await page.screenshot({ path: 'test-results/formula-graph.png' });
 });
 
-test('circle path point follows its host and circle splits into removable sectors', async ({ page }) => {
+test('path point follows its host and generic shape cutting creates removable pieces', async ({ page }) => {
   await page.goto('/'); await newDrawing(page);
   await page.getByRole('button', { name: '원 (C)', exact: true }).click();
   const origin = await worldPosition(page, 0, 0), right = await worldPosition(page, 2, 0);
@@ -73,24 +73,27 @@ test('circle path point follows its host and circle splits into removable sector
   await page.getByRole('spinbutton', { name: 'X1', exact: true }).fill('1'); await page.keyboard.press('Tab');
   const movedProject = await savedProject(page);
   expect(Number(await page.getByTestId(`object-${point.id}`).locator('circle').first().getAttribute('cx'))).toBeCloseTo(movedProject.viewport.x + 3 * 48 * movedProject.viewport.zoom, 1);
-  const movedRight = await worldPosition(page, 3, 0), top = await worldPosition(page, 1, 2);
-  await page.getByRole('button', { name: '선택한 원 나누기', exact: true }).click();
-  await page.mouse.click(movedRight.x, movedRight.y); await page.mouse.click(top.x, top.y);
-  await expect(page.locator('[data-object-type="arc"]')).toHaveCount(2);
-  await page.getByRole('button', { name: '부채꼴로 닫기', exact: true }).click();
-  await expect(page.locator('[data-object-type="sector"]')).toHaveCount(1);
-  const split = await savedProject(page), other = split.scene.objects.find(o => o.type === 'arc')!;
+  await page.getByRole('button', { name: '사각형 (R)', exact: true }).click();
+  await drag(page, await worldPosition(page, 4, 1), await worldPosition(page, 6, -1));
+  const rectangle = (await savedProject(page)).scene.objects.find(o => o.type === 'rectangle')!;
+  await page.getByRole('button', { name: `${rectangle.name} 선택`, exact: true }).click();
+  await page.getByRole('button', { name: '도형 자르기 (X)', exact: true }).click();
+  await expect(page.getByTestId('cut-hint')).toContainText('첫 번째 점');
+  const bottom = await worldPosition(page, 5, -2), top = await worldPosition(page, 5, 2);
+  await page.mouse.click(bottom.x, bottom.y);
+  await expect(page.getByTestId('cut-hint')).toContainText('두 번째 점');
+  await page.mouse.click(top.x, top.y);
+  await expect(page.locator('[data-object-type="polygon"]')).toHaveCount(2);
+  await expect(page.locator('[data-object-type="rectangle"]')).toHaveCount(0);
+  const split = await savedProject(page), other = split.scene.objects.find(o => o.type === 'polygon' && o.id !== rectangle.id)!;
   await page.getByRole('button', { name: `${other.name} 선택`, exact: true }).click();
   await page.getByRole('button', { name: '삭제', exact: true }).click();
-  await expect(page.locator('[data-object-type="arc"]')).toHaveCount(0);
-  await expect(page.locator('[data-object-type="sector"]')).toHaveCount(1);
-  const sector = split.scene.objects.find(o => o.type === 'sector')!;
-  await page.getByRole('button', { name: `${sector.name} 선택`, exact: true }).click();
-  await page.screenshot({ path: 'test-results/circle-sectors.png' });
+  await expect(page.locator('[data-object-type="polygon"]')).toHaveCount(1);
+  await page.screenshot({ path: 'test-results/shape-cut.png' });
   await page.getByRole('button', { name: '실행 취소', exact: true }).click();
-  await expect(page.locator('[data-object-type="arc"]')).toHaveCount(1);
+  await expect(page.locator('[data-object-type="polygon"]')).toHaveCount(2);
   const project = await savedProject(page);
-  await page.locator('input[type=file]').setInputFiles({ name: 'sector.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(project)) });
+  await page.locator('input[type=file]').setInputFiles({ name: 'cut.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(project)) });
   expect((await savedProject(page)).scene.objects).toEqual(project.scene.objects);
 });
 

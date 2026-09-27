@@ -32,7 +32,7 @@ export function snapPoint(point: Vec, objects: SceneObject[], viewport: Viewport
       const projection = projectToPath(point, object, objects);
       if (projection && Math.hypot(projection.point.x - point.x, projection.point.y - point.y) <= tolerance) {
         candidates.path.push(projection);
-        if (nearPaths.length < 96 && (object.type === 'line' || object.type === 'arrow' || 'center' in object)) nearPaths.push(object);
+        if (nearPaths.length < 12 && (object.type === 'line' || object.type === 'arrow' || object.type === 'polygon' || object.type === 'rectangle' || object.type === 'plot' || 'center' in object)) nearPaths.push(object);
       }
     }
     if ('center' in object) {

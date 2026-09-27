@@ -1,7 +1,8 @@
 import { uid, type Anchor, type ArcObject, type PathBinding, type PointObject, type SceneObject, type Vec } from './types';
-import { angleOnArc, atAngle, dependsOn, finitePoint, normalizeAngle, projectToPath, resolveAnchor, resolvePoint } from './paths';
-import { samplePlot } from './plot';
+import { angleOnArc, atAngle, dependsOn, finitePoint, normalizeAngle, pathVertices, projectToPath, resolveAnchor, resolvePoint } from './paths';
 import { isObjectDefined } from './defined';
+import { shapeBoundary, splitBoundaryByLine } from './planar';
+import { samplePlot } from './plot';
 export { angleOnArc, dependsOn, hasDependencyCycle, normalizeAngle, objectDependencies, pathPoint, pathVertices, projectToPath, resolveAnchor, resolvePoint } from './paths';
 
 export function objectAnchors(object: SceneObject, objects: SceneObject[]): Vec[] {
@@ -168,4 +169,105 @@ export function splitCircle(objects: SceneObject[], circleId: string, startAngle
       : { objectId: secondId, t: Math.max(0, Math.min(1, (travel - sweep) / (360 - sweep))) };
     return [{ ...object, position: resolvePoint(object, objects), binding }];
   });
+}
+
+export interface CutResult { objects: SceneObject[]; pieceIds: string[] }
+
+const signedSide = (point: Vec, start: Vec, direction: Vec) => direction.x * (point.y - start.y) - direction.y * (point.x - start.x);
+function splitPolyline(points: Vec[], start: Vec, direction: Vec): Vec[][] {
+  if (points.length < 2) return [];
+  const pieces: Vec[][] = [];
+  let current = [points[0]], splitCount = 0;
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1], b = points[i], da = signedSide(a, start, direction), db = signedSide(b, start, direction);
+    if (da * db < -1e-12) {
+      const t = da / (da - db), intersection = { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+      current.push(intersection);
+      if (current.length >= 2) pieces.push(current);
+      current = [intersection, b]; splitCount++;
+    } else if (Math.abs(db) < 1e-10 && i < points.length - 1) {
+      current.push(b);
+      const nextSide = signedSide(points[i + 1], start, direction);
+      if (da * nextSide < -1e-12) { if (current.length >= 2) pieces.push(current); current = [b]; splitCount++; }
+    } else current.push(b);
+  }
+  if (current.length >= 2) pieces.push(current);
+  return splitCount ? pieces : [];
+}
+
+function objectForPiece(source: SceneObject, points: Vec[], index: number, count: number, objects: SceneObject[], closed: boolean): SceneObject {
+  const anchors: Anchor[] = points.map(point => {
+    if ('points' in source) {
+      const match = source.points.find(anchor => {
+        const resolved = resolveAnchor(anchor, objects);
+        return Math.hypot(resolved.x - point.x, resolved.y - point.y) < 1e-8;
+      });
+      if (match) return { ...match };
+    }
+    return { x: point.x, y: point.y };
+  });
+  const name = count === 2 ? `${source.name.slice(0, 494)} 조각 ${index + 1}` : `${source.name.slice(0, 492)} 조각 ${index + 1}`;
+  const style = { ...source.style };
+  if (source.type === 'arrow') {
+    const hasStart = source.style.arrows === 'start' || source.style.arrows === 'both';
+    const hasEnd = source.style.arrows === 'end' || source.style.arrows === 'both';
+    const startArrow = index === 0 && hasStart, endArrow = index === count - 1 && hasEnd;
+    style.arrows = startArrow && endArrow ? 'both' : startArrow ? 'start' : endArrow ? 'end' : 'none';
+  }
+  const common = { id: source.id, name, visible: source.visible, locked: false, style };
+  return { ...common, type: closed ? 'polygon' : source.type === 'arrow' ? 'arrow' : 'line', points: anchors } as SceneObject;
+}
+
+/** Split a selected line, arc, circle, sector, rectangle, or polygon with an infinite cutting line. */
+export function cutShape(objects: SceneObject[], objectId: string, start: Vec, end: Vec): CutResult | null {
+  const source = objects.find(object => object.id === objectId);
+  const direction = { x: end.x - start.x, y: end.y - start.y };
+  if (!source || source.locked || Math.hypot(direction.x, direction.y) < 1e-8) return null;
+
+  let pointPieces: Vec[][];
+  const closed = shapeBoundary(source, objects);
+  if (closed) {
+    pointPieces = splitBoundaryByLine(closed, start, end);
+  } else {
+    let paths: Vec[][] = [];
+    if (source.type === 'line' || source.type === 'arrow') paths = [pathVertices(source, objects)];
+    else if (source.type === 'arc') {
+      const center = resolveAnchor(source.center, objects), steps = Math.max(2, Math.ceil(Math.abs(source.sweepAngle) / 3));
+      paths = [Array.from({ length: steps + 1 }, (_, index) => atAngle(center, source.radius, source.startAngle + source.sweepAngle * index / steps))];
+    }
+    else if (source.type === 'plot') paths = samplePlot(source);
+    else return null;
+    pointPieces = [];
+    let crossed = false;
+    for (const path of paths) {
+      const pieces = splitPolyline(path, start, direction);
+      if (pieces.length) { crossed = true; pointPieces.push(...pieces); }
+      else if (source.type === 'plot' && path.length >= 2) pointPieces.push(path);
+    }
+    if (!crossed) return null;
+  }
+  if (pointPieces.length < 2) return null;
+
+  const originalBoundPoints = objects.filter((object): object is PointObject => object.type === 'point' && object.binding?.objectId === objectId)
+    .map(point => ({ point, position: resolvePoint(point, objects) }));
+  const ids = pointPieces.map((_, index) => index === 0 ? source.id : uid());
+  const pieces = pointPieces.map((points, index) => {
+    const piece = objectForPiece(source, points, index, pointPieces.length, objects, !!closed);
+    return { ...piece, id: ids[index], visible: source.visible, locked: false } as SceneObject;
+  });
+  const replaced = objects.flatMap(object => object.id === objectId ? pieces : [object]);
+  const nextObjects = replaced.map(object => {
+    if (object.type !== 'point') return object;
+    const bound = originalBoundPoints.find(item => item.point.id === object.id);
+    if (!bound) return object;
+    let best: { point: Vec; binding: PathBinding } | null = null, distance = Infinity;
+    for (const host of pieces) {
+      const projected = projectToPath(bound.position, host, replaced);
+      if (!projected) continue;
+      const current = Math.hypot(projected.point.x - bound.position.x, projected.point.y - bound.position.y);
+      if (current < distance) { best = projected; distance = current; }
+    }
+    return best ? { ...object, position: bound.position, binding: best.binding } : withoutBinding(object, bound.position);
+  });
+  return { objects: nextObjects, pieceIds: ids };
 }

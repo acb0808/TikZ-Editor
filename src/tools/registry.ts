@@ -16,7 +16,9 @@ export const tools: ToolDefinition[] = [
   { id: 'polygon', label: '다각형', shortcut: 'G', hint: '꼭짓점을 차례로 클릭 · 첫 점 또는 Enter로 완성 · Esc로 취소' },
   { id: 'text', label: '텍스트', shortcut: 'T', hint: '위치를 클릭한 뒤 속성 패널에서 내용을 편집하세요' },
   { id: 'math', label: '수식', shortcut: 'M', hint: '위치를 클릭한 뒤 속성 패널에서 LaTeX 수식을 입력하세요' },
-  { id: 'split', label: '원 나누기', shortcut: 'S', hint: '원을 선택한 뒤 둘레의 두 곳을 클릭 · Esc로 취소' },
+  { id: 'cut', label: '도형 자르기', shortcut: 'X', hint: '도형을 선택한 뒤 자를 선을 가로질러 두 점 지정 · Esc로 취소' },
+  { id: 'fill', label: '영역 색칠', shortcut: 'B', hint: '닫힌 도형이나 선으로 둘러싸인 안쪽을 클릭해 채우기' },
+  { id: 'perpendicular', label: '수선', shortcut: 'N', hint: '점을 클릭한 뒤 기준 선분을 클릭해 수선 내리기' },
 ];
 export const TOOL_REGISTRY = tools;
 

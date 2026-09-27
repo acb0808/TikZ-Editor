@@ -18,7 +18,7 @@ export type SceneObject = ObjectBase & (
   | { type: 'text' | 'math'; position: Anchor; text: string; fontSize: number }
 );
 export type ObjectType = SceneObject['type'];
-export type ToolId = 'select' | 'hand' | 'split' | Exclude<ObjectType, 'plot' | 'arc' | 'sector'>;
+export type ToolId = 'select' | 'hand' | 'cut' | 'fill' | 'perpendicular' | Exclude<ObjectType, 'plot' | 'arc' | 'sector'>;
 export type PlotObject = Extract<SceneObject, { type: 'plot' }>;
 export type PointObject = Extract<SceneObject, { type: 'point' }>;
 export type ArcObject = Extract<SceneObject, { type: 'arc' | 'sector' }>;

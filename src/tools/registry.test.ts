@@ -30,8 +30,8 @@ describe('drawing tools', () => {
     expect(b.style.stroke).not.toBe('#ffffff');
     expect(new Set(tools.map(tool => tool.shortcut.toLowerCase())).size).toBe(tools.length);
   });
-  it('exposes circle splitting without adding plotting to drag drawing tools', () => {
-    expect(tools.find(tool => tool.id === 'split')?.shortcut).toBe('S');
+  it('exposes general shape cutting without adding plotting to drag drawing tools', () => {
+    expect(tools.find(tool => tool.id === 'cut')?.shortcut).toBe('X');
     expect(tools.some(tool => String(tool.id) === 'plot')).toBe(false);
   });
   it('stores an independent path binding on a newly created point', () => {
